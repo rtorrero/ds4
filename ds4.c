@@ -64856,21 +64856,31 @@ static int engine_compute_cuda_ep_placement(
  * across every GPU the user requested. Balancing the layer range shares
  * the streaming work evenly.
  *
- * Dense weights (attention + shared expert + norms) are small relative to
- * any reasonable --gpu-vram budget, so this contiguous split never spills
- * to CPU. e->n_placement_entries and e->multi_tier are updated in place. */
-static void engine_balance_placement_for_ssd(ds4_engine *e,
-                                              const ds4_gpu_config *cfg) {
+ * Fit validation: the proportional split is computed into a scratch array
+ * and only committed when every tier's assigned dense+KV footprint
+ * (entry_bytes, which already includes the per-layer KV estimate) fits
+ * within that tier's effective budget (avail_bytes, the same post-reserve
+ * budget the packer used). Dense weights are normally tiny relative to the
+ * per-tier budget so this always fits; but if a config (huge --ctx, tiny
+ * --gpu-vram) would overflow a tier we leave the packer's original — which
+ * fit by construction — placement untouched and warn, instead of silently
+ * OOMing at session_create. Returns 1 if the balanced split was applied,
+ * 0 if it was skipped (already single-tier, or would not fit). */
+static int engine_balance_placement_for_ssd(ds4_engine *e,
+                                          const ds4_gpu_config *cfg,
+                                          const size_t *entry_bytes,
+                                          const size_t *avail_bytes) {
     const int n_gpus = cfg->n_gpus;
     const int n_layers = DS4_N_LAYER;
-    if (n_gpus < 2 || n_layers < 1) return;
+    if (n_gpus < 2 || n_layers < 1) return 0;
 
     double total = 0.0;
     for (int d = 0; d < n_gpus; d++) total += (double)cfg->vram_bytes[d];
-    if (total <= 0) return;
+    if (total <= 0) return 0;
 
+    int proposed[DS4_MAX_LAYER + 2];
     /* Entry 0 (token embedding) on tier 0. */
-    e->placement[0] = 0;
+    proposed[0] = 0;
 
     /* Walk transformer layers in order, assigning each to the tier whose
      * cumulative budget share covers this layer's fractional position. This
@@ -64883,17 +64893,45 @@ static void engine_balance_placement_for_ssd(ds4_engine *e,
             t++;
             cumulative += (double)cfg->vram_bytes[t];
         }
-        e->placement[i] = t;
+        proposed[i] = t;
     }
 
     /* Output head (entry n_layers+1) on the highest tier that owns a layer. */
     int last_tier = 0;
     for (int i = 1; i <= n_layers; i++) {
-        if (e->placement[i] > last_tier) last_tier = e->placement[i];
+        if (proposed[i] > last_tier) last_tier = proposed[i];
     }
-    e->placement[n_layers + 1] = last_tier;
+    proposed[n_layers + 1] = last_tier;
+
+    /* Validate the split against each tier's effective budget. entry_bytes
+     * already folds in the per-layer KV estimate, so used[d] is the resident
+     * footprint tier d would carry under this split. */
+    if (avail_bytes) {
+        size_t used[DS4_LAYER_PACK_MAX_GPUS] = {0};
+        for (int i = 0; i <= n_layers + 1; i++) {
+            const int tier = proposed[i];
+            if (tier >= 0 && tier < n_gpus) used[tier] += entry_bytes[i];
+        }
+        for (int d = 0; d < n_gpus; d++) {
+            if (used[d] > avail_bytes[d]) {
+                fprintf(stderr,
+                        "ds4: SSD streaming layer rebalance skipped: tier %d "
+                        "would need %.2f GiB (dense+KV) but only %.2f GiB is "
+                        "available after reserves. Keeping the packer's "
+                        "original placement (unbalanced across GPUs). Lower "
+                        "--ctx or raise --gpu-vram to balance the stream.\n",
+                        d,
+                        (double)used[d] / (1024.0 * 1024.0 * 1024.0),
+                        (double)avail_bytes[d] / (1024.0 * 1024.0 * 1024.0));
+                return 0;
+            }
+        }
+    }
+
+    memcpy(e->placement, proposed, sizeof(int) * (size_t)(n_layers + 2));
     e->n_placement_entries = n_layers + 2;
     e->multi_tier = last_tier > 0 ? 1 : 0;
+    return 1;
 }
 
 /* Phase A: classify multi-tier on a freshly-opened engine (model loaded,
@@ -64991,7 +65029,9 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
      * causes CPU-spill. Under CUDA TP this is skipped: TP needs the
      * sharded placement produced by engine_compute_cuda_ep_placement. */
     if (e->ssd_streaming && !cuda_tp_ep && e->gpu_cfg.n_gpus >= 2) {
-        engine_balance_placement_for_ssd(e, &e->gpu_cfg);
+        (void)engine_balance_placement_for_ssd(e, &e->gpu_cfg,
+                                             entry_bytes,
+                                             pcfg.gpu_budget_bytes);
     }
 
     int first_tier = e->placement[0];
