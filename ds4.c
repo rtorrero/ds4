@@ -66423,9 +66423,35 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     if (opt->mtp_path && opt->mtp_path[0] &&
         opt->distributed.role == DS4_DISTRIBUTED_NONE) {
-        /* SSD streaming + MTP/DSpark: previously refused upstream ("not compatible
-         * yet"). Allowed here — the support model loads resident while the main
-         * model streams; verify correctness end-to-end. */
+        /* SSD streaming + MTP/DSpark: upstream refused this outright ("not
+         * compatible yet"). This lineage enables it — the support model
+         * loads resident while the main model streams, and DSpark scratch
+         * is allocated on the executor tier (see
+         * metal_graph_configure_dspark_capture) — but it has NOT been
+         * validated end-to-end upstream, and the multi-tier SSD + speculative
+         * decode interaction is exactly where the tier-drift and per-tier
+         * cache hazards live. Follow the codebase's experimental-feature
+         * pattern (cf. DS4_ROCM_GLM_TP): keep the default on the refused
+         * path and require an explicit opt-in, so nobody silently lands on an
+         * unvalidated speculative path and anyone enabling it is told to
+         * verify output quality. */
+        if (e->ssd_streaming && getenv("DS4_SSD_ALLOW_MTP") == NULL) {
+            fprintf(stderr,
+                    "ds4: --ssd-streaming + --mtp-model is experimental and "
+                    "not validated end-to-end (speculative decode over "
+                    "streamed experts). Refusing by default. Set "
+                    "DS4_SSD_ALLOW_MTP=1 to enable, and verify output quality "
+                    "before trusting it.\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (e->ssd_streaming) {
+            fprintf(stderr,
+                    "ds4: WARNING: --ssd-streaming + --mtp-model enabled via "
+                    "DS4_SSD_ALLOW_MTP=1 — experimental; check acceptance "
+                    "rates and output correctness on your workload.\n");
+        }
         model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
         ds4_dspark_summary dspark = {0};
         e->support_kind =
