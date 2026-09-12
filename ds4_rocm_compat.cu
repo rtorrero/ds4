@@ -13,6 +13,40 @@ ds4_gpu_ctx g_gpu[DS4_MAX_GPUS] = {};
 int g_n_gpus = 1;
 int g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS] = {{1}};
 
+/* Multi-tier SSD debug probe (ROCm). The CUDA backend defines the real
+ * cross-device probe in ds4_cuda.cu; the header declares it for ROCm too,
+ * and ds4.c calls it from its shared #ifndef DS4_NO_GPU staging paths, so
+ * the symbol must exist here or the ROCm link fails with an undefined
+ * reference. The ROCm backend is single-GPU per process (see
+ * rocm_tier_valid / ds4_gpu_init_multi), so a full multi-device sync sweep
+ * is meaningless; we mirror the CUDA contract with a single-device HIP
+ * check gated on DS4_SSD_DEBUG. Returns 0 when the probe is off. */
+static int ds4_rocm_ssd_debug_on(void) {
+    static int e = -1;
+    if (e < 0) {
+        const char *s = getenv("DS4_SSD_DEBUG");
+        e = (s && s[0] == '1') ? 1 : 0;
+    }
+    return e;
+}
+
+extern "C" int ds4_gpu_debug_probe(const char *where, int il, int tier) {
+    int dev = -1;
+    (void)hipGetDevice(&dev);
+    int phys = (tier >= 0 && tier < g_n_gpus) ? g_gpu[tier].device_id : -99;
+    if (!ds4_rocm_ssd_debug_on()) return 0;
+    hipError_t err = hipDeviceSynchronize();
+    hipError_t peek = hipGetLastError();
+    if (err != hipSuccess && peek == hipSuccess) peek = err;
+    fprintf(stderr,
+            "ds4[probe] %-30s il=%-3u tier=%d phys_dev=%d ambient_dev=%d n_gpus=%d err=%d%s%s\n",
+            where ? where : "?", (unsigned)il, tier, phys, dev, g_n_gpus,
+            (int)peek, peek != hipSuccess ? " :: " : "",
+            peek != hipSuccess ? hipGetErrorString(peek) : "");
+    fflush(stderr);
+    return (int)peek;
+}
+
 extern "C" int ds4_gpu_matmul_q4_K_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,

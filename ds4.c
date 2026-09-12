@@ -66523,7 +66523,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
              * on first use. Mirrors the single-tier sequence below. */
             ds4_gpu_set_glm_model(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA);
             ds4_gpu_set_ssd_streaming(e->ssd_streaming);
-            if (!ds4_engine_configure_streaming_auto_cache(e)) {
+            if (!ds4_engine_configure_streaming_auto_cache(e, opt->context_size)) {
                 ds4_engine_close(e);
                 *out = NULL;
                 return 1;
