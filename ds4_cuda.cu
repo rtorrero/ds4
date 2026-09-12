@@ -169,6 +169,16 @@ typedef struct {
     ds4_gpu_tensor slot_selected_tensor;
 } cuda_stream_selected_cache;
 
+/* The PR lineage moved this global into the ROCm runtime (rocm/
+ * ds4_rocm_runtime.cuh) but left the CUDA mxfp4 streaming path below
+ * referencing it, so the CUDA translation unit no longer compiled. The
+ * mxfp4 branch is runtime-gated (if (mxfp4_path) / cuda_use_mxfp4_mmq())
+ * and is not taken for non-MXFP4 quants such as IQ2XXS on sm_70, so a
+ * zero-initialized instance is the correct CUDA-side definition: the
+ * selected-cache fast path stays disabled and the path falls back to
+ * streaming, exactly as before. */
+static cuda_stream_selected_cache g_stream_selected_cache;
+
 /* Resident LRU expert cache (port from feat/mgpu-ssd). One slab per tier
  * holding the most-recently-used routed experts (gate/up/down weight tiles)
  * resident in VRAM, so that decode tokens hitting already-cached experts
